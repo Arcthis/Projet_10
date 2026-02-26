@@ -1,0 +1,10 @@
+﻿product_id,onsale_web,price,stock_quantity,stock_status
+4055,0,86.1,1,outofstock
+4090,0,73.0,6,outofstock
+4092,0,47.0,6,outofstock
+4954,1,25.0,0,instock
+4973,0,10.0,-1,outofstock
+5700,1,44.5,-1,outofstock
+5826,1,41.2,12,outofstock
+6125,0,14.2,48,outofstock
+

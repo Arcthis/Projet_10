@@ -1,0 +1,195 @@
+id: reconciliation-vins
+namespace: workflow.vins
+
+inputs:
+  - id: erp
+    type: FILE
+  - id: web
+    type: FILE
+  - id: liaison
+    type: FILE
+
+triggers:
+  - id: planification
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "0 9 15 * *"
+
+tasks:
+  - id: process_all
+    type: io.kestra.plugin.scripts.python.Script
+    containerImage: kestra_op/my-kestra-python:latest
+    inputFiles:
+      erp.xlsx: "{{ inputs.erp }}"
+      web.xlsx: "{{ inputs.web }}"
+      liaison.xlsx: "{{ inputs.liaison }}"
+    outputFiles:
+      - erp_clean.csv
+      - web_clean.csv
+      - liaison_clean.csv
+      - vins_premium.csv
+      - vins_ordinaire.csv
+      - rapport_ca.xlsx
+      - stock_incoherences.csv
+    script: |
+      import pandas as pd
+      import numpy as np
+      import duckdb
+
+      df_erp = pd.read_excel("erp.xlsx")
+      df_web = pd.read_excel("web.xlsx")
+      df_liaison = pd.read_excel("liaison.xlsx")
+
+      df_web = df_web.dropna(subset=["sku"])
+      df_web = df_web[df_web["post_type"] == "product"]
+
+      df_erp = df_erp.drop_duplicates()
+      df_web = df_web.drop_duplicates()
+      df_liaison = df_liaison.drop_duplicates()
+
+      print(f"[INFO] Nb lignes ERP (hors header) : {len(df_erp)}")
+      print(f"[INFO] Nb lignes Web (hors header) : {len(df_web)}")
+      print(f"[INFO] Nb lignes Liaison (hors header) : {len(df_liaison)}")
+
+      df_erp.to_csv("erp_clean.csv", index=False)
+      df_web.to_csv("web_clean.csv", index=False)
+      df_liaison.to_csv("liaison_clean.csv", index=False)
+
+      con = duckdb.connect()
+      con.execute("CREATE OR REPLACE TABLE erp_dedup AS SELECT DISTINCT * FROM read_csv_auto('erp_clean.csv')")
+      con.execute("CREATE OR REPLACE TABLE web_dedup AS SELECT DISTINCT * FROM read_csv_auto('web_clean.csv')")
+
+      con.execute("""
+      CREATE OR REPLACE TABLE fusion AS
+      SELECT DISTINCT e.product_id, e.price, e.stock_quantity, w.total_sales, w.post_title, l.id_web
+      FROM erp_dedup e
+      JOIN read_csv_auto('liaison_clean.csv') l ON e.product_id = l.product_id
+      JOIN web_dedup w ON w.sku = l.id_web
+      """)
+
+      con.execute("""
+      CREATE OR REPLACE TABLE ca_produits AS
+      SELECT product_id, SUM(price * total_sales) AS ca_produit
+      FROM fusion
+      GROUP BY product_id
+      """)
+      con.execute("""
+      CREATE OR REPLACE TABLE ca_total AS
+      SELECT SUM(ca_produit) AS chiffre_affaires_total
+      FROM ca_produits
+      """)
+
+      df_fusion = con.execute("SELECT product_id, price, total_sales FROM fusion").fetchdf()
+      ca_produits = con.execute("SELECT * FROM ca_produits").fetchdf()
+      ca_total = con.execute("SELECT * FROM ca_total").fetchdf()
+      fusion = con.execute("SELECT * FROM fusion").fetchdf()
+
+      mean_price = df_fusion['price'].mean() if not df_fusion.empty else 0.0
+      std_price = df_fusion['price'].std() if not df_fusion.empty else 0.0
+      if std_price == 0 or np.isnan(std_price):
+          df_fusion['zscore'] = 0.0
+          df_fusion['categorie'] = 'ordinaire'
+      else:
+          df_fusion['zscore'] = (df_fusion['price'] - mean_price) / std_price
+          df_fusion['categorie'] = np.where(df_fusion['zscore'] > 2, 'premium', 'ordinaire')
+
+      df_fusion[df_fusion['categorie']=='premium'].to_csv("vins_premium.csv", index=False)
+      df_fusion[df_fusion['categorie']=='ordinaire'].to_csv("vins_ordinaire.csv", index=False)
+
+      with pd.ExcelWriter("rapport_ca.xlsx") as writer:
+          ca_produits.to_excel(writer, sheet_name="CA_Produits", index=False)
+          ca_total.to_excel(writer, sheet_name="CA_Total", index=False)
+          fusion.to_excel(writer, sheet_name="Fusion", index=False)
+
+      nb_fusion = len(df_fusion)
+      nb_premium = len(df_fusion[df_fusion['categorie']=='premium'])
+      if not ca_total.empty and 'chiffre_affaires_total' in ca_total.columns:
+          ca_global = ca_total['chiffre_affaires_total'].iloc[0]
+          ca_global_display = f"{ca_global:,.2f}"
+      else:
+          ca_global = 0.0
+          ca_global_display = "0.00"
+
+      print(f"[INFO] Nb lignes Fusion (hors header) : {nb_fusion}")
+      print(f"[INFO] Nb vins premium détectés : {nb_premium}")
+      print(f"[INFO] CA global : {ca_global_display}")
+
+      if 'product_id' not in df_erp.columns:
+          raise Exception("Colonne 'product_id' manquante dans ERP")
+      if df_erp['product_id'].duplicated().any():
+          ndup = df_erp['product_id'].duplicated().sum()
+          raise Exception(f"Doublons détectés dans ERP sur 'product_id' : {ndup} doublons")
+
+      if 'sku' not in df_web.columns:
+          raise Exception("Colonne 'sku' manquante dans Web")
+      if df_web['sku'].duplicated().any():
+          ndup = df_web['sku'].duplicated().sum()
+          raise Exception(f"Doublons détectés dans Web sur 'sku' : {ndup} doublons")
+
+      if not {'product_id','id_web'}.issubset(df_liaison.columns):
+          raise Exception("Colonnes 'product_id' et/ou 'id_web' manquantes dans Liaison")
+      if df_liaison.duplicated(subset=['product_id','id_web']).any():
+          ndup = df_liaison.duplicated(subset=['product_id','id_web']).sum()
+          raise Exception(f"Doublons détectés dans Liaison sur (product_id,id_web) : {ndup} doublons")
+
+      if df_erp['product_id'].isnull().any():
+          nnull = df_erp['product_id'].isnull().sum()
+          raise Exception(f"Valeurs manquantes détectées dans ERP sur 'product_id' : {nnull} lignes")
+
+      if df_web['sku'].isnull().any():
+          nnull = df_web['sku'].isnull().sum()
+          raise Exception(f"Valeurs manquantes détectées dans Web sur 'sku' : {nnull} lignes")
+
+      if df_liaison['product_id'].isnull().any() or df_liaison['id_web'].isnull().any():
+          nnull_pid = df_liaison['product_id'].isnull().sum()
+          nnull_idweb = df_liaison['id_web'].isnull().sum()
+          print(f"[WARNING] Valeurs manquantes dans Liaison : product_id={nnull_pid}, id_web={nnull_idweb}")
+
+      nb_liaison = len(df_liaison)
+      if nb_fusion < nb_liaison:
+          print(f"[WARNING] Certaines liaisons n'ont pas trouvé de correspondance ERP/Web : "
+                f"liaison={nb_liaison}, matched={nb_fusion}")
+
+      df_fusion['total_sales'] = pd.to_numeric(df_fusion['total_sales'], errors='coerce').fillna(0)
+      df_fusion['price'] = pd.to_numeric(df_fusion['price'], errors='coerce').fillna(0)
+      ca_recalc = (df_fusion['price'] * df_fusion['total_sales']).sum()
+      if not np.isclose(ca_recalc, float(ca_global), atol=1e-6):
+          raise Exception(f"Incohérence entre CA recalculé ({ca_recalc}) et CA total ({ca_global})")
+
+      if df_fusion['categorie'].isnull().any():
+          raise Exception("Certaines lignes n'ont pas reçu de catégorie (premium/ordinaire)")
+
+      df_stock_check = df_erp.copy()
+
+      df_stock_check['stock_quantity'] = pd.to_numeric(df_stock_check['stock_quantity'], errors='coerce').fillna(-1).astype(int)
+      df_stock_check['stock_status'] = df_stock_check['stock_status'].astype(str).str.lower()
+
+      conditions = (
+          (df_stock_check['stock_quantity'] < 0) |  # stock négatif
+          ((df_stock_check['stock_quantity'] == 0) & (df_stock_check['stock_status'] != 'outofstock')) |
+          ((df_stock_check['stock_quantity'] > 0) & (df_stock_check['stock_status'] != 'instock'))
+      )
+      df_incoherences = df_stock_check.loc[conditions]
+
+      if not df_incoherences.empty:
+          print(f"[WARNING] Incohérences de stock détectées : {len(df_incoherences)} lignes")
+          df_incoherences.to_csv("stock_incoherences.csv", index=False)
+      else:
+          print("[INFO] Aucune incohérence détectée dans le stock ERP")          
+
+outputs:
+  - id: rapport_excel
+    type: FILE
+    value: "{{ outputs.process_all.outputFiles['rapport_ca.xlsx'] }}"
+
+  - id: vins_premium
+    type: FILE
+    value: "{{ outputs.process_all.outputFiles['vins_premium.csv'] }}"
+
+  - id: vins_ordinaire
+    type: FILE
+    value: "{{ outputs.process_all.outputFiles['vins_ordinaire.csv'] }}"
+
+  - id: stock_incoherences
+    type: FILE
+    value: "{{ outputs.process_all.outputFiles['stock_incoherences.csv'] }}"
+

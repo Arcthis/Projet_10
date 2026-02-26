@@ -1,0 +1,98 @@
+id: reconciliation-vins
+namespace: workflow.vins
+
+inputs:
+  - id: erp
+    type: FILE
+  - id: web
+    type: FILE
+  - id: liaison
+    type: FILE
+
+triggers:
+  - id: planification
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "0 9 15 * *"
+
+tasks:
+  - id: process_all
+    type: io.kestra.plugin.scripts.python.Script
+    containerImage: kestra_op/my-kestra-python:latest
+    inputFiles:
+      erp.xlsx: "{{ inputs.erp }}"
+      web.xlsx: "{{ inputs.web }}"
+      liaison.xlsx: "{{ inputs.liaison }}"
+    outputFiles:
+      - erp_clean.csv
+      - web_clean.csv
+      - liaison_clean.csv
+      - vins_premium.csv
+      - vins_ordinaire.csv
+      - rapport_ca.xlsx
+    script: |
+      import pandas as pd
+      import numpy as np
+      import duckdb
+
+      df_erp = pd.read_excel("erp.xlsx")
+      df_web = pd.read_excel("web.xlsx")
+      df_liaison = pd.read_excel("liaison.xlsx")
+
+      df_erp.to_csv("erp_clean.csv", index=False)
+      df_web.to_csv("web_clean.csv", index=False)
+      df_liaison.to_csv("liaison_clean.csv", index=False)
+
+      con = duckdb.connect()
+
+      con.execute("CREATE OR REPLACE TABLE erp_dedup AS SELECT DISTINCT * FROM read_csv_auto('erp_clean.csv')")
+      con.execute("CREATE OR REPLACE TABLE web_dedup AS SELECT DISTINCT * FROM read_csv_auto('web_clean.csv')")
+
+      con.execute("""
+      CREATE OR REPLACE TABLE fusion AS
+      SELECT DISTINCT e.product_id, e.price, e.stock_quantity, w.total_sales, w.post_title, l.id_web
+      FROM erp_dedup e
+      JOIN read_csv_auto('liaison_clean.csv') l ON e.product_id = l.product_id
+      JOIN web_dedup w ON w.sku = l.id_web
+      """)
+
+      con.execute("""
+      CREATE OR REPLACE TABLE ca_produits AS
+      SELECT product_id, SUM(price * total_sales) AS ca_produit
+      FROM fusion
+      GROUP BY product_id
+      """)
+      con.execute("""
+      CREATE OR REPLACE TABLE ca_total AS
+      SELECT SUM(ca_produit) AS chiffre_affaires_total
+      FROM ca_produits
+      """)
+
+      df_fusion = con.execute("SELECT product_id, price FROM fusion").fetchdf()
+      mean_price = df_fusion['price'].mean()
+      std_price = df_fusion['price'].std()
+      df_fusion['zscore'] = (df_fusion['price'] - mean_price) / std_price
+      df_fusion['categorie'] = np.where(df_fusion['zscore'] > 2, 'premium', 'ordinaire')
+      df_fusion[df_fusion['categorie']=='premium'].to_csv("vins_premium.csv", index=False)
+      df_fusion[df_fusion['categorie']=='ordinaire'].to_csv("vins_ordinaire.csv", index=False)
+
+      ca_produits = con.execute("SELECT * FROM ca_produits").fetchdf()
+      ca_total = con.execute("SELECT * FROM ca_total").fetchdf()
+      fusion = con.execute("SELECT * FROM fusion").fetchdf()
+
+      with pd.ExcelWriter("rapport_ca.xlsx") as writer:
+          ca_produits.to_excel(writer, sheet_name="CA_Produits", index=False)
+          ca_total.to_excel(writer, sheet_name="CA_Total", index=False)
+          fusion.to_excel(writer, sheet_name="Fusion", index=False)
+
+outputs:
+  - id: rapport_excel
+    type: FILE
+    value: "{{ outputs.process_all.outputFiles['rapport_ca.xlsx'] }}"
+
+  - id: vins_premium
+    type: FILE
+    value: "{{ outputs.process_all.outputFiles['vins_premium.csv'] }}"
+
+  - id: vins_ordinaire
+    type: FILE
+    value: "{{ outputs.process_all.outputFiles['vins_ordinaire.csv'] }}"
